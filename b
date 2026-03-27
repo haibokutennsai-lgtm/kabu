@@ -1,0 +1,300 @@
+# ---------------- 完全自動ポートフォリオBOT（完全版） ----------------
+import discord
+from discord.ext import commands, tasks
+import yfinance as yf
+import matplotlib.pyplot as plt
+import pandas as pd
+import datetime, os, asyncio, smtplib
+from fpdf import FPDF
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.mime.text import MIMEText
+
+# ---------------- Discord設定 ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+favorites = {}  # ユーザーごとの登録銘柄
+alerts = {}     # アラート設定
+emails = {}     # ユーザーのメールアドレス
+
+# ---------------- メール設定 ----------------
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_ADDRESS = "あなたのメール@gmail.com"
+EMAIL_PASSWORD = "アプリパスワード"
+
+# ---------------- BOT起動 ----------------
+@bot.event
+async def on_ready():
+    print("BOT起動成功")
+    check_alerts.start()
+    monitor_portfolio.start()
+    daily_portfolio_pdf.start()
+    weekly_portfolio_pdf.start()
+    monthly_portfolio_pdf.start()
+    save_excel_csv.start()
+    daily_portfolio_email.start()
+    weekly_portfolio_email.start()
+    monthly_portfolio_email.start()
+
+# ---------------- 株価取得 ----------------
+def get_price(code, period="2y"):
+    try:
+        if code.lower() in ['btc','eth','doge','xrp']:
+            code_yf = code.upper()+'-USD'
+        else:
+            code_yf = code
+        stock = yf.Ticker(code_yf)
+        data = stock.history(period=period)
+        if data.empty:
+            return None, None, None, None, None, code_yf
+        price = data["Close"].iloc[-1]
+        prev = data["Close"].iloc[-2] if len(data)>1 else price
+        change = price-prev
+        pct_change = (change/prev*100) if prev!=0 else 0
+        volatility = data["Close"].pct_change().std()*100
+        return price, change, pct_change, volatility, data, code_yf
+    except:
+        return None, None, None, None, None, code
+
+# ---------------- 登録・一覧 ----------------
+@bot.command()
+async def 登録(ctx, code):
+    user = ctx.author.id
+    favorites.setdefault(user, []).append(code.upper())
+    await ctx.send(f"{code} を登録しました")
+
+@bot.command()
+async def 一覧(ctx):
+    user = ctx.author.id
+    await ctx.send(favorites.get(user, []))
+
+# ---------------- 株価コマンド ----------------
+@bot.command()
+async def 株(ctx, code):
+    try:
+        code = code.strip().upper()
+        if not code.endswith(".T"):
+            await ctx.send("⚠️ 日本株は `.T` を付けてください（例: 7203.T）")
+            return
+        price, change, pct_change, _, _, _ = get_price(code, period="2d")
+        if price is None:
+            await ctx.send("⚠️ データ取得できませんでした")
+            return
+        await ctx.send(f"{code}\n現在: {price:.2f}円\n前日比: {change:.2f}円 ({pct_change:.2f}%)")
+    except Exception as e:
+        await ctx.send(f"💥 エラー発生: {e}")
+
+@bot.command()
+async def 米株(ctx, code):
+    try:
+        code = code.strip().upper()
+        price, _, _, _, _, _ = get_price(code, period="1d")
+        if price is None:
+            await ctx.send("⚠️ データ取得できませんでした")
+            return
+        await ctx.send(f"{code} ${price:.2f}")
+    except Exception as e:
+        await ctx.send(f"💥 エラー発生: {e}")
+
+@bot.command()
+async def 仮想通貨(ctx, code):
+    try:
+        code = code.strip().upper()
+        price, _, _, _, _, _ = get_price(code, period="1d")
+        if price is None:
+            await ctx.send("⚠️ データ取得できませんでした")
+            return
+        await ctx.send(f"{code} ${price:.2f}")
+    except Exception as e:
+        await ctx.send(f"💥 エラー発生: {e}")
+
+# ---------------- アラート ----------------
+@bot.command()
+async def 通知(ctx, code, price: float, direction="above", pct: bool=False, macd_signal: bool=False, volatility_trigger: float=None):
+    alerts.setdefault(code.upper(),[]).append((price,direction,ctx.channel.id,pct,macd_signal,volatility_trigger))
+    await ctx.send(f"{code} 通知設定しました: {price}{'%' if pct else '円'} {direction} MACD:{macd_signal} ボラ:{volatility_trigger}")
+
+@tasks.loop(seconds=60)
+async def check_alerts():
+    for code, alert_list in alerts.items():
+        price, change, pct_change, vol, data, _ = get_price(code)
+        if price is None or data is None:
+            continue
+        data['EMA12'] = data['Close'].ewm(span=12).mean()
+        data['EMA26'] = data['Close'].ewm(span=26).mean()
+        data['MACD'] = data['EMA12']-data['EMA26']
+        data['Signal'] = data['MACD'].ewm(span=9).mean()
+        macd_cross = data['MACD'].iloc[-2]<data['Signal'].iloc[-2] and data['MACD'].iloc[-1]>data['Signal'].iloc[-1]
+        for alert in alert_list[:]:
+            target,direction,channel_id,is_pct,macd_notify,vol_trigger = alert
+            current_val = pct_change if is_pct else price
+            trigger = (direction=="above" and current_val>=target) or (direction=="below" and current_val<=target)
+            vol_hit = vol_trigger is not None and vol >= vol_trigger
+            if trigger or (macd_notify and macd_cross) or vol_hit:
+                channel = bot.get_channel(channel_id)
+                msg = f"{code} 条件到達！現在値: {current_val:.2f} Vol:{vol:.2f}%"
+                if macd_notify and macd_cross:
+                    msg += " MACDゴールデンクロス発生！"
+                if vol_hit:
+                    msg += f" ボラティリティトリガー達成({vol_trigger}%)"
+                await channel.send(msg)
+                alert_list.remove(alert)
+
+# ---------------- ポートフォリオ監視 ----------------
+@tasks.loop(minutes=5)
+async def monitor_portfolio():
+    for user, codes in favorites.items():
+        for code in codes:
+            price, change, pct, vol, data, _ = get_price(code)
+            if price is None:
+                continue
+            if abs(pct) >= 5:
+                user_obj = await bot.fetch_user(user)
+                await user_obj.send(f"{code} 5%以上変動！ 現在値:{price} ({pct:.2f}%)")
+
+# ---------------- チャート作成 ----------------
+def create_full_chart(data, code, days=60):
+    data = data[-days:]
+    data['MA5'] = data['Close'].rolling(5).mean()
+    data['MA20'] = data['Close'].rolling(20).mean()
+    data['EMA12'] = data['Close'].ewm(span=12).mean()
+    data['EMA26'] = data['Close'].ewm(span=26).mean()
+    data['MACD'] = data['EMA12']-data['EMA26']
+    data['Signal'] = data['MACD'].ewm(span=9).mean()
+    delta = data['Close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain/avg_loss
+    data['RSI'] = 100-(100/(1+rs))
+    data['Upper'] = data['MA20']+2*data['Close'].rolling(20).std()
+    data['Lower'] = data['MA20']-2*data['Close'].rolling(20).std()
+    data['Volatility'] = data['Close'].pct_change()*100
+
+    fig, axs = plt.subplots(4,1,figsize=(12,10), gridspec_kw={'height_ratios':[3,1,1,1]})
+    axs[0].plot(data.index,data['Close'],label='Close',color='blue')
+    axs[0].plot(data.index,data['MA5'],label='MA5',color='orange')
+    axs[0].plot(data.index,data['MA20'],label='MA20',color='green')
+    axs[0].plot(data.index,data['Upper'],label='BB Upper',color='red',linestyle='--')
+    axs[0].plot(data.index,data['Lower'],label='BB Lower',color='red',linestyle='--')
+    axs[0].set_title(f"{code} 株価チャート")
+    axs[0].legend()
+    axs[1].plot(data.index,data['RSI'],label='RSI',color='purple')
+    axs[1].axhline(70,color='red',linestyle='--')
+    axs[1].axhline(30,color='green',linestyle='--')
+    axs[1].set_title("RSI(14)")
+    axs[1].legend()
+    axs[2].plot(data.index,data['MACD'],label='MACD',color='blue')
+    axs[2].plot(data.index,data['Signal'],label='Signal',color='orange')
+    axs[2].set_title("MACD")
+    axs[2].legend()
+    axs[3].plot(data.index,data['Volatility'],label='Volatility %',color='brown')
+    axs[3].set_title("ボラティリティ")
+    axs[3].legend()
+    timestamp=datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    filename=f"fullchart_{code}_{timestamp}.png"
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    return filename
+
+# ---------------- PDF作成 ----------------
+def create_pdf_chart(user_id, codes, days=60):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    files=[]
+    for code in codes:
+        _,_,_,_,data,code_yf=get_price(code,period=f"{days}d")
+        if data is None:
+            continue
+        filename=create_full_chart(data,code_yf,days)
+        files.append(filename)
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0,10,f"{code} チャート",0,1)
+        pdf.image(filename,x=10,y=30,w=190)
+    timestamp=datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    pdf_filename=f"portfolio_{user_id}_{timestamp}.pdf"
+    pdf.output(pdf_filename)
+    for f in files:
+        os.remove(f)
+    return pdf_filename
+
+# ---------------- PDF自動送信 ----------------
+@tasks.loop(hours=24)
+async def daily_portfolio_pdf():
+    for user, codes in favorites.items():
+        try:
+            user_obj = await bot.fetch_user(user)
+            pdf_file = create_pdf_chart(user, codes)
+            await user_obj.send(file=discord.File(pdf_file))
+            os.remove(pdf_file)
+        except:
+            continue
+
+# ---------------- Excel/CSV保存 ----------------
+@tasks.loop(hours=24)
+async def save_excel_csv():
+    for user, codes in favorites.items():
+        data_list=[]
+        for code in codes:
+            price, change, pct, vol, _, _ = get_price(code)
+            if price is None:
+                continue
+            data_list.append({'コード':code,'価格':price,'変化':change,'変化率(%)':pct,'ボラティリティ(%)':vol})
+        if data_list:
+            df=pd.DataFrame(data_list)
+            timestamp=datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            df.to_excel(f"portfolio_{user}_{timestamp}.xlsx",index=False)
+            df.to_csv(f"portfolio_{user}_{timestamp}.csv",index=False)
+
+# ---------------- メール登録・送信 ----------------
+@bot.command()
+async def メール登録(ctx, email):
+    user = ctx.author.id
+    emails[user] = email
+    await ctx.send(f"{email} をメール送信先として登録しました")
+
+def send_email(to_email, subject, body, attachments=[]):
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_ADDRESS
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body,'plain'))
+    for file in attachments:
+        part = MIMEBase('application','octet-stream')
+        with open(file,'rb') as f:
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition',f'attachment; filename="{os.path.basename(file)}"')
+        msg.attach(part)
+    with smtplib.SMTP(SMTP_SERVER,SMTP_PORT) as server:
+        server.starttls()
+        server.login(EMAIL_ADDRESS,EMAIL_PASSWORD)
+        server.send_message(msg)
+
+async def send_portfolio_email(user, codes):
+    if user not in emails:
+        return
+    email = emails[user]
+    attachments=[]
+    pdf_file = create_pdf_chart(user, codes)
+    attachments.append(pdf_file)
+    subject="ポートフォリオレポート"
+    body="自動生成されたポートフォリオレポートです"
+    send_email(email, subject, body, attachments)
+    for f in attachments:
+        os.remove(f)
+
+@tasks.loop(hours=24)
+async def daily_portfolio_email():
+    for user, codes in favorites.items():
+        await send_portfolio_email(user, codes)
+
+# ---------------- BOT起動 ----------------
+bot.run("YOUR_BOT_TOKEN")
