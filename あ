@@ -1,0 +1,212 @@
+import discord
+from discord.ext import commands, tasks
+import yfinance as yf
+import matplotlib.pyplot as plt
+import pandas as pd
+from fpdf import FPDF
+import smtplib
+from email.message import EmailMessage
+import asyncio
+
+# -----------------------------
+# BOT設定
+# -----------------------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+favorites = {}  # ユーザーID -> 銘柄リスト
+alerts = {}     # 銘柄 -> (目標価格, channel_id)
+
+email_accounts = {}  # ユーザーID -> 受信メールアドレス
+
+# -----------------------------
+# 起動時イベント
+# -----------------------------
+@bot.event
+async def on_ready():
+    print("BOT起動成功")
+    print(bot.user)
+    print("登録されているコマンド一覧:")
+    for cmd in bot.commands:
+        print(cmd.name)
+    check_alerts.start()
+    auto_pdf_report.start()
+
+# -----------------------------
+# 株・為替・仮想通貨
+# -----------------------------
+@bot.command(name="株")
+async def stock(ctx, code):
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="2d")
+        price = data["Close"].iloc[-1]
+        prev = data["Close"].iloc[-2]
+        change = price - prev
+        await ctx.send(f"{code}\n現在: {price:.2f}円\n前日比: {change:.2f}円")
+    except:
+        await ctx.send("取得できませんでした")
+
+@bot.command(name="米株")
+async def us_stock(ctx, code):
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="1d")
+        price = data["Close"].iloc[-1]
+        await ctx.send(f"{code} ${price:.2f}")
+    except:
+        await ctx.send("取得できませんでした")
+
+@bot.command(name="仮想通貨")
+async def crypto(ctx, code):
+    try:
+        stock = yf.Ticker(f"{code}-USD")
+        data = stock.history(period="1d")
+        price = data["Close"].iloc[-1]
+        await ctx.send(f"{code} ${price:.2f}")
+    except:
+        await ctx.send("取得できませんでした")
+
+@bot.command(name="為替")
+async def fx(ctx):
+    try:
+        stock = yf.Ticker("USDJPY=X")
+        data = stock.history(period="1d")
+        price = data["Close"].iloc[-1]
+        await ctx.send(f"USD/JPY {price:.2f}")
+    except:
+        await ctx.send("取得できませんでした")
+
+# -----------------------------
+# お気に入り管理
+# -----------------------------
+@bot.command(name="登録")
+async def add_favorite(ctx, code):
+    user = ctx.author.id
+    favorites.setdefault(user, []).append(code)
+    await ctx.send(f"{code} を登録しました！")
+
+@bot.command(name="一覧")
+async def list_favorites(ctx):
+    user = ctx.author.id
+    favs = favorites.get(user, [])
+    if favs:
+        await ctx.send(f"あなたのお気に入り: {', '.join(favs)}")
+    else:
+        await ctx.send("お気に入りはまだありません")
+
+# -----------------------------
+# 通知アラート
+# -----------------------------
+@bot.command(name="通知")
+async def set_alert(ctx, code, price: float):
+    alerts[code] = (price, ctx.channel.id)
+    await ctx.send(f"{code} が {price:.2f}円 で通知されるように設定しました")
+
+@tasks.loop(seconds=60)
+async def check_alerts():
+    for code, (target, channel_id) in list(alerts.items()):
+        try:
+            stock = yf.Ticker(code)
+            data = stock.history(period="1d")
+            current = data["Close"].iloc[-1]
+            if current >= target:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"{code} {target:.2f}円 到達！現在価格: {current:.2f}円")
+                alerts.pop(code)
+        except:
+            continue
+
+# -----------------------------
+# チャート作成
+# -----------------------------
+@bot.command(name="チャート")
+async def chart(ctx, code):
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="5d")
+        plt.figure()
+        plt.plot(data.index, data["Close"])
+        plt.title(code)
+        plt.xlabel("日付")
+        plt.ylabel("価格")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("chart.png")
+        plt.close()
+        await ctx.send(file=discord.File("chart.png"))
+    except:
+        await ctx.send("チャート作成失敗")
+
+# -----------------------------
+# PDF作成
+# -----------------------------
+def generate_pdf(code, price):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, f"{code} レポート", ln=1)
+    pdf.cell(0, 10, f"現在価格: {price:.2f}", ln=1)
+    pdf.output("report.pdf")
+
+@bot.command(name="pdf")
+async def create_pdf(ctx, code):
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="5d")
+        price = data["Close"].iloc[-1]
+        generate_pdf(code, price)
+        await ctx.send(file=discord.File("report.pdf"))
+    except:
+        await ctx.send("PDF作成失敗")
+
+# -----------------------------
+# メール送信
+# -----------------------------
+def send_email(to_email, subject, content, attachment_path=None):
+    # Gmail SMTP の例
+    EMAIL_ADDRESS = "your_email@gmail.com"
+    EMAIL_PASSWORD = "your_app_password"
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = EMAIL_ADDRESS
+    msg['To'] = to_email
+    msg.set_content(content)
+    if attachment_path:
+        with open(attachment_path, 'rb') as f:
+            msg.add_attachment(f.read(), maintype='application', subtype='pdf', filename=attachment_path)
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        smtp.send_message(msg)
+
+@bot.command(name="メール登録")
+async def register_email(ctx, email):
+    user = ctx.author.id
+    email_accounts[user] = email
+    await ctx.send(f"{email} にレポートを送信できるように登録しました")
+
+# -----------------------------
+# 定期PDF自動生成＆メール送信（5分ごと）
+# -----------------------------
+@tasks.loop(minutes=5)
+async def auto_pdf_report():
+    for user_id, codes in favorites.items():
+        email = email_accounts.get(user_id)
+        if not email:
+            continue
+        for code in codes:
+            try:
+                stock = yf.Ticker(code)
+                data = stock.history(period="5d")
+                price = data["Close"].iloc[-1]
+                generate_pdf(code, price)
+                send_email(email, f"{code} レポート", f"{code} の最新レポートです", "report.pdf")
+            except:
+                continue
+
+# -----------------------------
+# BOT起動
+# -----------------------------
+bot.run("YOUR_BOT_TOKEN_HERE")  # ←ここをBOTトークンに置き換える
