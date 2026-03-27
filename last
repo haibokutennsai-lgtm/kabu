@@ -1,0 +1,193 @@
+# ---------------- 完全自動ポートフォリオBOT ----------------
+import discord
+from discord.ext import commands, tasks
+import yfinance as yf
+import matplotlib.pyplot as plt
+import pandas as pd
+import datetime, os, asyncio, smtplib
+from fpdf import FPDF
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.mime.text import MIMEText
+
+# ---------------- Discord設定 ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+favorites = {}  # ユーザーごとの登録銘柄
+alerts = {}     # アラート設定
+emails = {}     # ユーザーのメールアドレス
+
+# ---------------- メール設定 ----------------
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_ADDRESS = "あなたのメール@gmail.com"
+EMAIL_PASSWORD = "アプリパスワード"
+
+# ---------------- BOT起動 ----------------
+@bot.event
+async def on_ready():
+    print("BOT起動成功")
+    check_alerts.start()
+    monitor_portfolio.start()
+    daily_portfolio_pdf.start()
+    weekly_portfolio_pdf.start()
+    monthly_portfolio_pdf.start()
+    save_excel_csv.start()
+    daily_portfolio_email.start()
+    weekly_portfolio_email.start()
+    monthly_portfolio_email.start()
+
+# ---------------- 株価取得 ----------------
+def get_price(code, period="2y"):
+    try:
+        if code.lower() in ['btc','eth','doge','xrp']:
+            code_yf = code.upper()+'-USD'
+        else:
+            code_yf = code
+        stock = yf.Ticker(code_yf)
+        data = stock.history(period=period)
+        if data.empty or data["Close"].isna().all():
+            return None, None, None, None, None, code_yf
+        price = data["Close"].iloc[-1]
+        prev = data["Close"].iloc[-2] if len(data)>1 else price
+        change = price-prev
+        pct_change = (change/prev*100) if prev!=0 else 0
+        volatility = data["Close"].pct_change().std()*100
+        return price, change, pct_change, volatility, data, code_yf
+    except Exception as e:
+        print("get_priceエラー:", e)
+        return None, None, None, None, None, code
+
+# ---------------- 登録・一覧 ----------------
+@bot.command()
+async def 登録(ctx, code):
+    user = ctx.author.id
+    favorites.setdefault(user, []).append(code)
+    await ctx.send(f"{code} を登録しました")
+
+@bot.command()
+async def 一覧(ctx):
+    user = ctx.author.id
+    await ctx.send(favorites.get(user, []))
+
+# ---------------- 通知 ----------------
+@bot.command()
+async def 通知(ctx, code, price: float, direction="above"):
+    alerts.setdefault(code,[]).append((price,direction,ctx.channel.id))
+    await ctx.send(f"{code} 通知設定しました: {price}円 {direction}")
+
+@tasks.loop(seconds=60)
+async def check_alerts():
+    for code, alert_list in alerts.items():
+        try:
+            price, change, pct, vol, data, _ = get_price(code)
+            if price is None: 
+                continue
+            for alert in alert_list[:]:
+                target, direction, channel_id = alert
+                trigger = (direction=="above" and price>=target) or (direction=="below" and price<=target)
+                if trigger:
+                    channel = bot.get_channel(channel_id)
+                    await channel.send(f"{code} アラート到達！ 現在値: {price:.2f}円")
+                    alert_list.remove(alert)
+        except:
+            continue
+
+# ---------------- ポートフォリオ監視 ----------------
+@tasks.loop(minutes=5)
+async def monitor_portfolio():
+    for user, codes in favorites.items():
+        for code in codes:
+            price, change, pct, vol, data, _ = get_price(code)
+            if price is None:
+                continue
+            if abs(pct) >= 5:
+                user_obj = await bot.fetch_user(user)
+                await user_obj.send(f"{code} 5%以上変動！ 現在値:{price:.2f} ({pct:.2f}%)")
+
+# ---------------- チャート作成 ----------------
+def create_chart(data, code):
+    if data is None or data.empty:
+        return None
+    plt.figure(figsize=(10,5))
+    plt.plot(data.index,data['Close'],label='Close')
+    plt.title(f"{code} 株価チャート")
+    plt.legend()
+    filename=f"{code}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+    plt.savefig(filename)
+    plt.close()
+    return filename
+
+@bot.command()
+async def チャート(ctx, code):
+    price, change, pct, vol, data, code_yf = get_price(code, period="60d")
+    if price is None:
+        await ctx.send("データ取得できませんでした")
+        return
+    filename = create_chart(data, code_yf)
+    if filename:
+        await ctx.send(file=discord.File(filename))
+        os.remove(filename)
+
+# ---------------- PDF作成 ----------------
+def create_pdf(user_id, codes):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    files=[]
+    for code in codes:
+        price, change, pct, vol, data, code_yf = get_price(code)
+        if price is None:
+            continue
+        filename = create_chart(data, code_yf)
+        if filename:
+            files.append(filename)
+            pdf.add_page()
+            pdf.set_font("Arial","B",16)
+            pdf.cell(0,10,f"{code} チャート",0,1)
+            pdf.image(filename,x=10,y=30,w=190)
+    timestamp=datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    pdf_filename=f"portfolio_{user_id}_{timestamp}.pdf"
+    pdf.output(pdf_filename)
+    for f in files:
+        os.remove(f)
+    return pdf_filename
+
+@tasks.loop(hours=24)
+async def daily_portfolio_pdf():
+    for user, codes in favorites.items():
+        try:
+            user_obj = await bot.fetch_user(user)
+            pdf_file = create_pdf(user, codes)
+            await user_obj.send(file=discord.File(pdf_file))
+            os.remove(pdf_file)
+        except:
+            continue
+
+# ---------------- Excel/CSV保存 ----------------
+@tasks.loop(hours=24)
+async def save_excel_csv():
+    for user, codes in favorites.items():
+        data_list=[]
+        for code in codes:
+            price, change, pct, vol, data, _ = get_price(code)
+            if price is None:
+                continue
+            data_list.append({'コード':code,'価格':price,'変化':change,'変化率(%)':pct,'ボラティリティ(%)':vol})
+        if data_list:
+            df=pd.DataFrame(data_list)
+            timestamp=datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            df.to_excel(f"portfolio_{user}_{timestamp}.xlsx",index=False)
+            df.to_csv(f"portfolio_{user}_{timestamp}.csv",index=False)
+
+# ---------------- メール登録 ----------------
+@bot.command()
+async def メール登録(ctx,email):
+    user = ctx.author.id
+    emails[user]=email
+    await ctx.send(f"{email} をメール送信先として登録しました")
+
+# ---------------- BOT起動 ----------------
+bot.run("YOUR_BOT_TOKEN")
