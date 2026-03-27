@@ -1,0 +1,165 @@
+import discord
+from discord.ext import commands, tasks
+import yfinance as yf
+import matplotlib.pyplot as plt
+import pandas as pd
+from fpdf import FPDF
+import asyncio
+
+# -----------------------------
+# BOT設定
+# -----------------------------
+intents = discord.Intents.default()
+intents.message_content = True  # メッセージ内容を読むIntent
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+favorites = {}  # お気に入り銘柄
+alerts = {}     # 通知アラート
+
+# -----------------------------
+# 起動時イベント
+# -----------------------------
+@bot.event
+async def on_ready():
+    print("BOT起動成功")
+    print(bot.user)
+    print("登録されているコマンド一覧:")
+    for cmd in bot.commands:
+        print(cmd.name)
+    check_alerts.start()  # 通知タスク開始
+
+# -----------------------------
+# 株価コマンド
+# -----------------------------
+@bot.command(name="株")
+async def stock(ctx, code):
+    """日本株の現在価格と前日比"""
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="2d")
+        price = data["Close"].iloc[-1]
+        prev = data["Close"].iloc[-2]
+        change = price - prev
+        await ctx.send(f"{code}\n現在: {price:.2f}円\n前日比: {change:.2f}円")
+    except Exception as e:
+        await ctx.send(f"取得できませんでした: {e}")
+
+@bot.command(name="米株")
+async def us_stock(ctx, code):
+    """米国株"""
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="1d")
+        price = data["Close"].iloc[-1]
+        await ctx.send(f"{code} ${price:.2f}")
+    except Exception as e:
+        await ctx.send(f"取得できませんでした: {e}")
+
+@bot.command(name="仮想通貨")
+async def crypto(ctx, code):
+    """仮想通貨価格"""
+    try:
+        stock = yf.Ticker(f"{code}-USD")
+        data = stock.history(period="1d")
+        price = data["Close"].iloc[-1]
+        await ctx.send(f"{code} ${price:.2f}")
+    except Exception as e:
+        await ctx.send(f"取得できませんでした: {e}")
+
+@bot.command(name="為替")
+async def fx(ctx):
+    """USD/JPYレート"""
+    try:
+        stock = yf.Ticker("USDJPY=X")
+        data = stock.history(period="1d")
+        price = data["Close"].iloc[-1]
+        await ctx.send(f"USD/JPY {price:.2f}")
+    except Exception as e:
+        await ctx.send(f"取得できませんでした: {e}")
+
+# -----------------------------
+# お気に入り管理
+# -----------------------------
+@bot.command(name="登録")
+async def add_favorite(ctx, code):
+    user = ctx.author.id
+    favorites.setdefault(user, []).append(code)
+    await ctx.send(f"{code} を登録しました！")
+
+@bot.command(name="一覧")
+async def list_favorites(ctx):
+    user = ctx.author.id
+    favs = favorites.get(user, [])
+    if favs:
+        await ctx.send(f"あなたのお気に入り: {', '.join(favs)}")
+    else:
+        await ctx.send("お気に入りはまだありません")
+
+# -----------------------------
+# 通知アラート
+# -----------------------------
+@bot.command(name="通知")
+async def set_alert(ctx, code, price: float):
+    alerts[code] = (price, ctx.channel.id)
+    await ctx.send(f"{code} が {price:.2f}円 で通知されるように設定しました")
+
+@tasks.loop(seconds=60)
+async def check_alerts():
+    for code, (target, channel_id) in list(alerts.items()):
+        try:
+            stock = yf.Ticker(code)
+            data = stock.history(period="1d")
+            current = data["Close"].iloc[-1]
+            if current >= target:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"{code} {target:.2f}円 到達！現在価格: {current:.2f}円")
+                alerts.pop(code)  # 通知したら削除
+        except:
+            continue
+
+# -----------------------------
+# チャート作成
+# -----------------------------
+@bot.command(name="チャート")
+async def chart(ctx, code):
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="5d")
+        plt.figure()
+        plt.plot(data.index, data["Close"])
+        plt.title(code)
+        plt.xlabel("日付")
+        plt.ylabel("価格")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("chart.png")
+        plt.close()
+        await ctx.send(file=discord.File("chart.png"))
+    except Exception as e:
+        await ctx.send(f"チャート作成失敗: {e}")
+
+# -----------------------------
+# PDF作成（任意レポート）
+# -----------------------------
+@bot.command(name="pdf")
+async def create_pdf(ctx, code):
+    try:
+        stock = yf.Ticker(code)
+        data = stock.history(period="5d")
+        price = data["Close"].iloc[-1]
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 10, f"{code} レポート", ln=1)
+        pdf.cell(0, 10, f"現在価格: {price:.2f}", ln=1)
+        pdf.output("report.pdf")
+        await ctx.send(file=discord.File("report.pdf"))
+    except Exception as e:
+        await ctx.send(f"PDF作成失敗: {e}")
+
+# -----------------------------
+# BOT起動
+# -----------------------------
+bot.run("YOUR_BOT_TOKEN_HERE")  # ←ここをあなたのBOTトークンに置き換えてください
